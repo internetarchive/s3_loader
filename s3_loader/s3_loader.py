@@ -14,6 +14,7 @@ import sys
 import time
 import syslog
 import logging
+import traceback
 from datetime import datetime
 
 import yaml
