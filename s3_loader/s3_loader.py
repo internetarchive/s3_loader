@@ -24,7 +24,7 @@ from docopt import docopt
 
 
 class S3_Loader():
-    def __init__(self, dir, prefix, s3_key, s3_secret, max_files=10, max_size=1073741824):
+    def __init__(self, dir, prefix, s3_key, s3_secret, max_files=10, max_size=10737418240):
         self.dir = dir
         assert os.path.exists(dir)
 
