@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import socket
 import syslog
 import logging
 import traceback
@@ -24,7 +25,7 @@ from docopt import docopt
 
 
 class S3_Loader():
-    def __init__(self, dir, prefix, s3_key, s3_secret, max_files=10, max_size=10737418240):
+    def __init__(self, dir, prefix, s3_key, s3_secret, metadata, max_files=10, max_size=10737418240):
         self.dir = dir
         assert os.path.exists(dir)
 
@@ -37,6 +38,7 @@ class S3_Loader():
         self.s3_secure = False
 
         self.upload_prefix = prefix
+        self.metadata      = metadata
 
 
     def get_dir_contents(self):
@@ -50,6 +52,7 @@ class S3_Loader():
         filelist = []
         for file, size in zip(files, sizes):
             filelist.append(file)
+            upload_size += size
 
             if len(filelist) == self.max_files:
                 break
@@ -57,9 +60,10 @@ class S3_Loader():
                 #if there is a single file larger than max_size, upload it anyway
                 if len(filelist) > 1:
                     a.pop()
+                    upload_size -= size
                 break
 
-        return filelist
+        return filelist, upload_size
 
 
     def get_seq_num(self, file):
@@ -94,7 +98,35 @@ class S3_Loader():
         return bucket_name
 
 
-    def s3_get_bucket(self, conn, bucket_name):
+    def format_metadata(self, filelist, upload_size):
+        host = socket.gethostname()
+        first_timestamp = self.get_timestamp(filelist[0])
+        last_timestamp  = self.get_timestamp(filelist[-1])
+        start_date = datetime.strptime(first_timestamp[:14], '%Y%m%d%H%M%S').isoformat() + ' UTC'
+        end_date   = datetime.strptime(last_timestamp[:14], '%Y%m%d%H%M%S').isoformat() + ' UTC'
+
+        re_host  = re.compile('CRAWLHOST')
+        re_start = re.compile('START_DATE')
+        re_end   = re.compile('END_DATE')
+
+        headers = {}
+        for k, v in self.metadata.iteritems():
+            v = re_host.sub(host, v)
+            v = re_start.sub(start_date, v)
+            v = re_end.sub(end_date, v)
+
+            key = 'x-archive-meta-'+k
+            headers[key] = v
+
+        headers['x-archive-size-hint'] = str(upload_size)
+
+        logger.debug('metadata dict:')
+        logger.debug(headers)
+
+        return headers
+
+
+    def s3_get_bucket(self, conn, bucket_name, filelist, upload_size):
         #Maybe we already tried to make a bucket on a previous run, but the
         #catalog was locked up. Let's see how it is looking..
         bucket = conn.lookup(bucket_name)
@@ -103,8 +135,9 @@ class S3_Loader():
             return bucket
 
         logger.info('Creating bucket ' + bucket_name)
+        headers = self.format_metadata(filelist, upload_size)
         #todo: do we need to add retry?
-        bucket = conn.create_bucket(bucket_name)
+        bucket = conn.create_bucket(bucket_name, headers=headers)
 
         #Now we need to block until the item has been created in paired storage
         #so subsequent writes will work
@@ -112,12 +145,12 @@ class S3_Loader():
         while i<10:
             b = conn.lookup(bucket_name)
             if b is not None:
-                break
+                return bucket
             logger.debug('Waiting for bucket creation...')
             time.sleep(60)
             i+=1
 
-        return bucket
+        raise NameError("Could not create or lookup " + bucket_name)
 
 
     def s3_upload_file(self, bucket, filename, no_derive=True):
@@ -133,11 +166,11 @@ class S3_Loader():
 
 
     def upload_and_delete_files(self, files, sizes):
-        filelist    = self.make_filelist(files, sizes)
+        filelist, upload_size = self.make_filelist(files, sizes)
         bucket_name = self.make_bucket_name(filelist)
 
         conn = boto.connect_s3(self.s3_key, self.s3_secret, host=self.s3_host, is_secure=self.s3_secure)
-        bucket = self.s3_get_bucket(conn, bucket_name)
+        bucket = self.s3_get_bucket(conn, bucket_name, filelist, upload_size)
 
         for filename in filelist:
             if bucket.get_key(filename) is not None:
@@ -169,7 +202,7 @@ class S3_Loader():
                 logger.info('size (%d) >= max_size (%d), uploading!' % (size, self.max_size))
                 self.upload_and_delete_files(files, sizes)
             else:
-                logger.debug('num_files (%d) < max_files (%d) and size (%d) < max_size (%d), waiting for more files.' % (num_files, self.max_files, size, self.max_size))
+                logger.info('num_files (%d) < max_files (%d) and size (%d) < max_size (%d), waiting for more files.' % (num_files, self.max_files, size, self.max_size))
 
             logger.debug('Sleeping...')
             time.sleep(600)
@@ -226,7 +259,7 @@ if __name__ == "__main__":
         #logging.basicConfig(level=logging.DEBUG) #uncomment to turn on verbose boto logging
         logger = get_logger(script_name, logging.DEBUG)
 
-        s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'])
+        s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'])
         s3_loader.run()
     else:
         logger = get_logger(script_name, logging.INFO, use_syslog=True)
@@ -234,7 +267,7 @@ if __name__ == "__main__":
         daemonize()
 
         try:
-            s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'])
+            s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'])
             s3_loader.run()
         except:
             t = traceback.format_exc()
