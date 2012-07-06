@@ -12,11 +12,9 @@ import os
 import re
 import sys
 import time
-import socket
 import syslog
 import logging
 import traceback
-from datetime import datetime
 
 import yaml
 import boto
@@ -25,7 +23,7 @@ from docopt import docopt
 
 
 class S3_Loader():
-    def __init__(self, dir, prefix, s3_key, s3_secret, metadata, max_files=10, max_size=10737418240):
+    def __init__(self, dir, prefix, s3_key, s3_secret, metadata, logger, max_files=10, max_size=10737418240):
         self.dir = dir
         assert os.path.exists(dir)
 
@@ -39,6 +37,7 @@ class S3_Loader():
 
         self.upload_prefix = prefix
         self.metadata      = metadata
+        self.logger        = logger
 
 
     def get_dir_contents(self):
@@ -66,63 +65,22 @@ class S3_Loader():
         return filelist, upload_size
 
 
-    def get_seq_num(self, file):
-        m = re.match('\w+-\d+-(\d+).w?arc.gz$', file)
-        if m:
-            seq_num = m.group(1)
-        else:
-            logger.info('Could not find sequence number in filename (%s), using 00000 instead.' % (file))
-            seq_num = '00000'
-        return seq_num
-
-
-    def get_timestamp(self, file):
-        m = re.match('\w+-(\d+)-\d+.w?arc.gz$', file)
-        if m:
-            timestamp = m.group(1)
-        else:
-            logger.info('Could not find timestamp in filename (%s), using ctime instead.' % (file))
-            secs = os.path.getctime(os.path.join(self.dir, file))
-            dt = datetime.utcfromtimestamp(secs)
-            #truncating the six digits of microseconds to three digits
-            #is the same as converting to milliseconds (div by 1000)
-            timestamp = dt.strftime('%Y%m%d%H%M%S%f')[:17]
-        return timestamp
-
-
     def make_bucket_name(self, filelist):
-        first_seq_num   = self.get_seq_num(filelist[0])
-        first_timestamp = self.get_timestamp(filelist[0])
-        last_timestamp  = self.get_timestamp(filelist[-1])
-        bucket_name = "%s-%s-%s-%s" % (self.upload_prefix, first_timestamp, first_seq_num, last_timestamp)
+        bucket_name = "%s-%s-%s" % (self.upload_prefix, filelist[0], filelist[-1])
         return bucket_name
 
 
     def format_metadata(self, filelist, upload_size):
-        host = socket.gethostname()
-        first_timestamp = self.get_timestamp(filelist[0])
-        last_timestamp  = self.get_timestamp(filelist[-1])
-        start_date = datetime.strptime(first_timestamp[:14], '%Y%m%d%H%M%S').isoformat() + ' UTC'
-        end_date   = datetime.strptime(last_timestamp[:14], '%Y%m%d%H%M%S').isoformat() + ' UTC'
-
-        re_host  = re.compile('CRAWLHOST')
-        re_start = re.compile('START_DATE')
-        re_end   = re.compile('END_DATE')
-
         headers = {}
         for k, v in self.metadata.iteritems():
-            v = re_host.sub(host, v)
-            v = re_start.sub(start_date, v)
-            v = re_end.sub(end_date, v)
-
             key = 'x-archive-meta-'+k
             headers[key] = v
 
         headers['x-archive-size-hint'] = str(upload_size)
 
-        logger.debug('metadata dict:')
-        logger.debug(headers)
-
+        self.logger.debug('metadata dict:')
+        self.logger.debug(headers)
+        sys.exit(-1)
         return headers
 
 
@@ -131,10 +89,10 @@ class S3_Loader():
         #catalog was locked up. Let's see how it is looking..
         bucket = conn.lookup(bucket_name)
         if bucket is not None:
-            logger.info('Found existing bucket ' + bucket_name)
+            self.logger.info('Found existing bucket ' + bucket_name)
             return bucket
 
-        logger.info('Creating bucket ' + bucket_name)
+        self.logger.info('Creating bucket ' + bucket_name)
         headers = self.format_metadata(filelist, upload_size)
         #todo: do we need to add retry?
         bucket = conn.create_bucket(bucket_name, headers=headers)
@@ -146,7 +104,7 @@ class S3_Loader():
             b = conn.lookup(bucket_name)
             if b is not None:
                 return bucket
-            logger.debug('Waiting for bucket creation...')
+            self.logger.debug('Waiting for bucket creation...')
             time.sleep(60)
             i+=1
 
@@ -154,7 +112,7 @@ class S3_Loader():
 
 
     def s3_upload_file(self, bucket, filename, no_derive=True):
-        logger.info('Uploading %s with no_derive=%s' % (filename, no_derive))
+        self.logger.info('Uploading %s with no_derive=%s' % (filename, no_derive))
         key = Key(bucket)
         key.name = filename
 
@@ -174,7 +132,7 @@ class S3_Loader():
 
         for filename in filelist:
             if bucket.get_key(filename) is not None:
-                logger.warning('File %s already exists, not deleting from server!' % filename)
+                self.logger.warning('File %s already exists, not deleting from server!' % filename)
                 continue
 
             #only queue a derive after uploading the last file
@@ -184,27 +142,27 @@ class S3_Loader():
 
             self.s3_upload_file(bucket, filename, no_derive=no_derive)
 
-            logger.info('Deleting local copy of %s' % filename)
+            self.logger.info('Deleting local copy of %s' % filename)
             os.unlink(os.path.join(self.dir, filename))
 
 
     def run(self):
-        logger.info("Starting s3 uploader, waiting for files...\n")
+        self.logger.info("Starting s3 uploader, waiting for files...\n")
         while True:
             files, sizes = self.get_dir_contents()
             num_files = len(files)
             size = sum(sizes)
 
             if num_files >= self.max_files:
-                logger.info('num_files (%d) >= max_files (%d), uploading!' % (num_files, self.max_files))
+                self.logger.info('num_files (%d) >= max_files (%d), uploading!' % (num_files, self.max_files))
                 self.upload_and_delete_files(files, sizes)
             elif size >= self.max_size:
-                logger.info('size (%d) >= max_size (%d), uploading!' % (size, self.max_size))
+                self.logger.info('size (%d) >= max_size (%d), uploading!' % (size, self.max_size))
                 self.upload_and_delete_files(files, sizes)
             else:
-                logger.info('num_files (%d) < max_files (%d) and size (%d) < max_size (%d), waiting for more files.' % (num_files, self.max_files, size, self.max_size))
+                self.logger.info('num_files (%d) < max_files (%d) and size (%d) < max_size (%d), waiting for more files.' % (num_files, self.max_files, size, self.max_size))
 
-            logger.debug('Sleeping...')
+            self.logger.debug('Sleeping...')
             time.sleep(600)
 
 
@@ -259,7 +217,7 @@ if __name__ == "__main__":
         #logging.basicConfig(level=logging.DEBUG) #uncomment to turn on verbose boto logging
         logger = get_logger(script_name, logging.DEBUG)
 
-        s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'])
+        s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'], logger)
         s3_loader.run()
     else:
         logger = get_logger(script_name, logging.INFO, use_syslog=True)
@@ -267,7 +225,7 @@ if __name__ == "__main__":
         daemonize()
 
         try:
-            s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'])
+            s3_loader = S3_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'], logger)
             s3_loader.run()
         except:
             t = traceback.format_exc()
