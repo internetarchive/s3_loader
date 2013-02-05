@@ -97,7 +97,7 @@ if __name__ == "__main__":
         #logging.basicConfig(level=logging.DEBUG) #uncomment to turn on verbose boto logging
         logger = s3_loader.s3_loader.get_logger(script_name, logging.DEBUG)
 
-        s3_loader = Liveweb_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'], logger)
+        s3_loader = Liveweb_Loader(d['dir'], d['prefix'], d['s3_key'], d['s3_secret'], d['metadata'], logger, maxfiles=2)
         s3_loader.run()
     else:
         logger = s3_loader.s3_loader.get_logger(script_name, logging.INFO, use_syslog=True)
